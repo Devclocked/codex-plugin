@@ -1,0 +1,40 @@
+{
+  "name": "devclocked-codex",
+  "version": "1.0.0",
+  "description": "Automatic time tracking for Codex with live hooks, recovery fallback, and DevClocked activity tools.",
+  "author": {
+    "name": "DevClocked",
+    "url": "https://devclocked.com"
+  },
+  "homepage": "https://devclocked.com",
+  "repository": "https://github.com/Devclocked/codex-plugin",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "time-tracking",
+    "productivity",
+    "developer-tools",
+    "analytics",
+    "devclocked"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks.json",
+  "interface": {
+    "displayName": "DevClocked",
+    "shortDescription": "Track Codex coding time and ask DevClocked about your activity.",
+    "longDescription": "DevClocked brings time tracking into Codex with hook-driven activity capture, local queued delivery, MCP-powered summaries, and fallback protection against missed sessions.",
+    "developerName": "DevClocked",
+    "category": "Productivity",
+    "capabilities": [],
+    "brandColor": "#D4A843",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "defaultPrompt": [
+      "Use DevClocked data when I ask how long I've been coding or what I worked on"
+    ],
+    "websiteURL": "https://devclocked.com",
+    "privacyPolicyURL": "https://devclocked.com/privacy",
+    "termsOfServiceURL": "https://devclocked.com/terms"
+  }
+}
