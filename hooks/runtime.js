@@ -84,14 +84,27 @@ function resolveRepo(input, stream, gitContext) {
   return { branch: null, repo_name: 'unknown' };
 }
 
-function classifyActivity(hookEvent, input) {
+function streamStateId(stream) {
+  return stream.throttleId || stream.rootStreamId || stream.streamId;
+}
+
+function classifyActivity(hookEvent, input, stream) {
   const toolName = normalizedToolName(input);
 
   switch (hookEvent) {
     case 'SessionStart':
       return { activity_type: 'coding', sub_type: 'session_start' };
-    case 'Stop':
-      return { activity_type: 'coding', sub_type: 'session_end' };
+    case 'Stop': {
+      // Don't fabricate a "coding" tick at session close (DEV-530 class bug) —
+      // reuse the last real classification shipped for this stream, if any.
+      // If the session ended with no prior real activity, omit activity_type
+      // rather than guessing.
+      const priorState = stream ? runtime.getStreamState(streamStateId(stream)) : null;
+      if (priorState && priorState.last_activity_type) {
+        return { activity_type: priorState.last_activity_type, sub_type: 'session_end' };
+      }
+      return { activity_type: undefined, sub_type: 'session_end' };
+    }
     case 'UserPromptSubmit':
       return { activity_type: 'planning', sub_type: 'prompt_submit' };
     case 'PostToolUse':
@@ -118,7 +131,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
     entity = `codex://thread/${stream.rootStreamId}`;
   }
 
-  const activity = classifyActivity(hookEvent, input);
+  const activity = classifyActivity(hookEvent, input, stream);
   const workSignature = {
     read_count: 0,
     write_count: isWrite ? 1 : 0,
@@ -126,7 +139,15 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
     plan_count: activity.activity_type === 'planning' ? 1 : 0,
     total_turns: 1,
   };
-  const runtimeMs = 5_000;
+  // Stop has no tool-call duration of its own; when we know when the last
+  // real tick for this stream landed, use the actual elapsed time instead of
+  // the fixed estimate.
+  let runtimeMs = 5_000;
+  if (hookEvent === 'Stop') {
+    const priorState = runtime.getStreamState(streamStateId(stream));
+    const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+    if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
+  }
   const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
   const sessionFileId =
     runtime.firstOpaqueId(input.thread_id, input.session_id, input.conversation_id) || undefined;

@@ -8,6 +8,7 @@ const {
   appendLog,
   buildTrackTickRequest,
   callEdgeFunction,
+  classifyActivity,
   discardEnvelope,
   getStreamState,
   markEnvelopeRetry,
@@ -24,6 +25,15 @@ const runtime = require('./runtime');
 
 function isLifecycleEvent(hookEvent) {
   return ['SessionStart', 'Stop'].includes(hookEvent);
+}
+
+// True when the newly classified tick's activity type differs from the last
+// one shipped for this stream. Used to let transitions through the 30s
+// throttle window instead of hard-dropping them. When there's no recorded
+// prior type (e.g. state predates this field), we can't detect a transition,
+// so same-window ticks keep throttling as before.
+function isActivityTypeTransition(priorState, newActivityType) {
+  return Boolean(priorState?.last_activity_type) && priorState.last_activity_type !== newActivityType;
 }
 
 function initializeLifecycleState(hookEvent, stream) {
@@ -56,9 +66,14 @@ async function processEnvelope(filePath, apiKey) {
   const stream = resolveStream(hookEvent, input);
   initializeLifecycleState(hookEvent, stream);
 
-  if (!isLifecycleEvent(hookEvent) && shouldThrottle(stream.throttleId || stream.streamId)) {
-    discardEnvelope(filePath, envelope, 'throttled');
-    return;
+  const throttleStateId = stream.throttleId || stream.streamId;
+  if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
+    const priorState = getStreamState(throttleStateId);
+    const newActivity = classifyActivity(hookEvent, input, stream);
+    if (!isActivityTypeTransition(priorState, newActivity.activity_type)) {
+      discardEnvelope(filePath, envelope, 'throttled');
+      return;
+    }
   }
 
   const gitContext = resolveGitContext(input);
@@ -66,12 +81,21 @@ async function processEnvelope(filePath, apiKey) {
   const payload = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext);
 
   try {
-    await callEdgeFunction(apiKey, 'track-tick', payload);
+    const response = await callEdgeFunction(apiKey, 'track-tick', payload);
+    if (!runtime.isTrackTickProcessed(response)) {
+      discardEnvelope(filePath, envelope, 'track_tick_unprocessed');
+      appendLog('shipper', 'Dropping hook event because track-tick processed no activity', {
+        file: path.basename(filePath),
+        hook_event_name: hookEvent,
+      });
+      return;
+    }
 
     if (!isLifecycleEvent(hookEvent)) {
-      const throttleStateId = stream.throttleId || stream.streamId;
       const state = getStreamState(throttleStateId) || {};
       state.last_tick_at = Date.now();
+      state.last_activity_type =
+        payload.ticks[0]?.activity_context?.ai_tool?.activity_type || state.last_activity_type;
       saveStreamState(throttleStateId, state);
     }
 
@@ -104,4 +128,8 @@ async function processEnvelope(filePath, apiKey) {
   }
 }
 
-runShipper(runtime, processEnvelope);
+if (require.main === module) {
+  runShipper(runtime, processEnvelope);
+}
+
+module.exports = { isActivityTypeTransition, isLifecycleEvent, processEnvelope };

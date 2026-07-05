@@ -292,6 +292,17 @@ function createPluginRuntime(options) {
     });
   }
 
+  function isTrackTickProcessed(response) {
+    try {
+      const body = typeof response?.body === 'string'
+        ? JSON.parse(response.body)
+        : response?.body;
+      return body?.session_updated === true || Number(body?.processed_count || 0) > 0;
+    } catch {
+      return false;
+    }
+  }
+
   function nextQueueFilePath() {
     ensureDir(QUEUE_DIR);
     return path.join(QUEUE_DIR, `${Date.now()}-${process.pid}-${randomUUID()}.json`);
@@ -489,6 +500,7 @@ function createPluginRuntime(options) {
     ensureDir,
     firstOpaqueId,
     getStreamState,
+    isTrackTickProcessed,
     listQueueFiles,
     loadAuth,
     markEnvelopeRetry,
