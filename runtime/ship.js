@@ -13,6 +13,13 @@ async function runShipper(runtime, processEnvelope) {
     for (const filePath of queueFiles) {
       await processEnvelope(filePath, apiKey);
     }
+
+    if (typeof runtime.pruneStaleStreamState === 'function') {
+      const pruned = runtime.pruneStaleStreamState();
+      if (pruned > 0) {
+        runtime.appendLog('shipper', 'Pruned stale stream state', { count: pruned });
+      }
+    }
   } catch (error) {
     runtime.appendLog('shipper', 'Shipper crashed', {
       error: error instanceof Error ? error.message : 'unknown_error',

@@ -52,36 +52,18 @@ function resolveStream(hookEvent, input) {
   };
 }
 
+// Naming is decided entirely by the identity ladder in resolveGitContext —
+// a deferred resolution must ship the tick with NO project name rather than
+// fall back to a basename guess (DEV-674). Codex's hook-provided git_branch
+// still wins over the git context's branch when present.
 function resolveRepo(input, stream, gitContext) {
-  if (gitContext.repoName || gitContext.branch) {
-    return {
-      branch: gitContext.branch || null,
-      repo_name: gitContext.repoName || null,
-    };
+  if (gitContext.resolution === 'deferred') {
+    return { branch: stream.gitBranch || null, repo_name: null };
   }
-
-  if (stream.gitBranch && input.cwd) {
-    return {
-      branch: stream.gitBranch,
-      repo_name: path.basename(input.cwd),
-    };
-  }
-
-  if (input.cwd) {
-    return {
-      branch: null,
-      repo_name: path.basename(input.cwd),
-    };
-  }
-
-  if (Array.isArray(input.workspace_roots) && input.workspace_roots.length > 0) {
-    return {
-      branch: null,
-      repo_name: path.basename(input.workspace_roots[0]),
-    };
-  }
-
-  return { branch: null, repo_name: 'unknown' };
+  return {
+    branch: gitContext.branch || stream.gitBranch || null,
+    repo_name: gitContext.repoName || null,
+  };
 }
 
 function streamStateId(stream) {
@@ -189,6 +171,13 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   const request = { ticks: [tick] };
   if (gitContext.workspaceFingerprint) {
     request.workspace_fingerprint = gitContext.workspaceFingerprint;
+  }
+  // Absolute path of the resolved workspace root (git root, or session cwd
+  // for non-git projects), sent alongside the one-way fingerprint hash so the
+  // backend can do directory-containment checks even when naming is deferred
+  // (DEV-551 contract, same field the daemon and cursor-plugin send).
+  if (gitContext.workspacePath || gitContext.gitRoot) {
+    request.workspace_path = gitContext.workspacePath || gitContext.gitRoot;
   }
   return request;
 }

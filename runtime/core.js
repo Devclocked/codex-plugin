@@ -18,6 +18,20 @@ const MAX_SHIP_ATTEMPTS = 5;
 const RETRY_BACKOFF_MS = 15_000;
 const PLUGIN_ACTIVITY_RETENTION_MS = 72 * 60 * 60 * 1000;
 const MAX_PLUGIN_ACTIVITY_ENTRIES = 1000;
+const STREAM_STATE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// Read the consuming plugin's version from its manifest. The shipper lives at
+// <plugin-root>/hooks/ship.js, so the manifest is two levels up. Returns
+// 'unknown' rather than throwing — the version stamp must never block shipping.
+function readPluginVersion(shipperPath) {
+  try {
+    const root = path.dirname(path.dirname(shipperPath));
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
+    return typeof manifest.version === 'string' && manifest.version ? manifest.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -63,6 +77,8 @@ function createPluginRuntime(options) {
   const namespace = options.namespace;
   const source = options.source;
   const shipperPath = options.shipperPath;
+  const execSyncImpl = options.execSyncImpl || execSync;
+  const pluginVersion = options.pluginVersion || readPluginVersion(shipperPath);
   const STATE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-state`);
   const QUEUE_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-queue`);
   const LOG_DIR = path.join(DEVCLOCKED_HOME, `${namespace}-logs`);
@@ -119,6 +135,39 @@ function createPluginRuntime(options) {
     return Date.now() - state.last_tick_at < TICK_INTERVAL_MS;
   }
 
+  // Sweep stream-state files older than the TTL. removeStreamState only fires on
+  // session close, which agent CLIs/editors deliver unreliably, so state would
+  // leak unbounded (observed 333 live streams) without this catch-all.
+  function pruneStaleStreamState(now = Date.now(), ttlMs = STREAM_STATE_TTL_MS) {
+    let removed = 0;
+    let files;
+    try {
+      files = fs.readdirSync(STATE_DIR);
+    } catch {
+      return 0;
+    }
+    for (const name of files) {
+      if (!name.startsWith('stream_') || !name.endsWith('.json')) continue;
+      const filePath = path.join(STATE_DIR, name);
+      let stale = true;
+      try {
+        const state = readJsonFile(filePath);
+        const lastSeen = state.last_tick_at || state.started_at;
+        stale = !lastSeen || now - lastSeen > ttlMs;
+      } catch {
+        stale = true;
+      }
+      if (!stale) continue;
+      try {
+        fs.unlinkSync(filePath);
+        removed += 1;
+      } catch {
+        // ignore
+      }
+    }
+    return removed;
+  }
+
   function toAbsoluteDir(maybePath) {
     if (!maybePath || typeof maybePath !== 'string') return null;
     const candidate = path.isAbsolute(maybePath)
@@ -133,17 +182,48 @@ function createPluginRuntime(options) {
     }
   }
 
-  function gitExec(cwd, command) {
+  // The detached shipper can inherit a stripped GUI/sandbox environment, so
+  // resolve git through the standard system locations even when PATH lacks
+  // them — a missing git binary must classify as unavailable, not "no repo".
+  const GIT_PATH_FALLBACK = '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin';
+
+  function classifyGitFailure(error) {
+    if (!error || typeof error !== 'object') return 'git_unavailable';
+    if (error.code === 'ETIMEDOUT' || error.signal === 'SIGTERM' || error.killed === true) {
+      return 'timeout';
+    }
+    if (error.code === 'ENOENT' || error.code === 'EAGAIN') return 'git_unavailable';
+    if (typeof error.status === 'number') {
+      // The shell ran but could not find/execute git.
+      if (error.status === 127 || error.status === 126) return 'git_unavailable';
+      const stderr = String(error.stderr || '');
+      if (error.status === 128 && /not a git repository/i.test(stderr)) return 'not_a_repo';
+      return 'git_error';
+    }
+    return 'git_unavailable';
+  }
+
+  function gitExecClassified(cwd, command) {
     try {
-      return execSync(command, {
+      const stdout = execSyncImpl(command, {
         cwd,
         timeout: 3000,
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          PATH: `${process.env.PATH || ''}:${GIT_PATH_FALLBACK}`,
+        },
       }).trim();
-    } catch {
-      return null;
+      return { ok: true, stdout };
+    } catch (error) {
+      return { ok: false, failure: classifyGitFailure(error) };
     }
+  }
+
+  function gitExec(cwd, command) {
+    const result = gitExecClassified(cwd, command);
+    return result.ok ? result.stdout : null;
   }
 
   function parseRepoFullName(repoUrl) {
@@ -190,69 +270,160 @@ function createPluginRuntime(options) {
     });
   }
 
-  function resolveGitContext(input) {
-    const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
-    const pathCandidates = [
-      input.file_path,
-      input.tool_input?.file_path,
-      Array.isArray(input.modified_files) ? input.modified_files[0] : null,
-      roots[0],
-      input.cwd,
-    ];
-
-    let workingDir = null;
-    for (const candidate of pathCandidates) {
-      const abs = toAbsoluteDir(candidate);
-      if (abs) {
-        workingDir = abs;
-        break;
-      }
-    }
-
-    if (!workingDir) {
-      return {
-        workspaceFingerprint: null,
-        repoUrl: null,
-        repoFullName: null,
-        repoName: null,
-        branch: null,
-        gitRoot: null,
-      };
-    }
-
-    const cached = loadCachedGitContext(workingDir);
-    if (cached) return cached;
-
-    const gitRoot = gitExec(workingDir, 'git rev-parse --show-toplevel') || workingDir;
-    let workspaceFingerprint = null;
+  function fingerprintPath(dirPath) {
     try {
-      const resolvedRoot = fs.realpathSync(gitRoot).replace(/\/+$/, '').toLowerCase();
-      workspaceFingerprint = createHash('sha256').update(resolvedRoot).digest('hex');
+      const resolved = fs.realpathSync(dirPath).replace(/\/+$/, '').toLowerCase();
+      return createHash('sha256').update(resolved).digest('hex');
     } catch {
-      workspaceFingerprint = null;
+      return null;
     }
+  }
 
+  function deferredGitContext(workspacePath, failure) {
+    return {
+      workspaceFingerprint: null,
+      repoUrl: null,
+      repoFullName: null,
+      repoName: null,
+      branch: null,
+      gitRoot: null,
+      workspacePath: workspacePath || null,
+      resolution: 'deferred',
+      resolutionFailure: failure || null,
+    };
+  }
+
+  function buildRepoGitContext(gitRoot) {
     const repoUrl = gitExec(gitRoot, 'git remote get-url origin');
     const repoFullName = parseRepoFullName(repoUrl);
     const branch = gitExec(gitRoot, 'git rev-parse --abbrev-ref HEAD');
     const repoName = repoFullName ? repoFullName.split('/').pop() : path.basename(gitRoot);
 
-    const gitContext = {
-      workspaceFingerprint,
+    return {
+      workspaceFingerprint: fingerprintPath(gitRoot),
       repoUrl: repoUrl || null,
       repoFullName,
       repoName: repoName || null,
       branch: branch || null,
       gitRoot,
+      workspacePath: gitRoot,
+      resolution: 'git',
+      resolutionFailure: null,
     };
+  }
 
-    saveCachedGitContext(workingDir, gitContext);
+  function isGuardedRoot(dirPath) {
+    let resolved = dirPath;
+    try {
+      resolved = fs.realpathSync(dirPath);
+    } catch {
+      // fall through with the raw path
+    }
+    const normalized = resolved.replace(/\/+$/, '') || '/';
+    let home = process.env.HOME || '';
+    try {
+      if (home) home = fs.realpathSync(home);
+    } catch {
+      // keep the raw value
+    }
+    home = home.replace(/\/+$/, '');
+    return normalized === '/' || (Boolean(home) && normalized === home);
+  }
+
+  // Identity resolution ladder (DEV-674 / DEV-671): git root when git ran,
+  // session-start cwd when git ran and said "not a repository", and DEFER
+  // whenever git could not run (missing binary, timeout, spawn failure) —
+  // never name a project from a per-tool-call file path, and never mint a
+  // fingerprint for a directory git could not vouch for.
+  function resolveGitContext(input) {
+    const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
+    const remote = input.devclocked_capture?.remote === true;
+    const sessionDir = toAbsoluteDir(input.cwd) || toAbsoluteDir(roots[0]);
+    const fileDirCandidates = [
+      input.file_path,
+      input.tool_input?.file_path,
+      Array.isArray(input.modified_files) ? input.modified_files[0] : null,
+    ];
+    let fileDir = null;
+    for (const candidate of fileDirCandidates) {
+      const abs = toAbsoluteDir(candidate);
+      if (abs) {
+        fileDir = abs;
+        break;
+      }
+    }
+
+    const identityDir = sessionDir || fileDir;
+    if (!identityDir) return deferredGitContext(null, 'no_working_dir');
+
+    const cached = loadCachedGitContext(identityDir);
+    if (cached && cached.resolution) return cached;
+
+    const rootResult = gitExecClassified(identityDir, 'git rev-parse --show-toplevel');
+    if (rootResult.ok) {
+      const gitContext = buildRepoGitContext(rootResult.stdout);
+      saveCachedGitContext(identityDir, gitContext);
+      return gitContext;
+    }
+
+    if (rootResult.failure !== 'not_a_repo') {
+      appendLog('shipper', 'Deferring project identity because git could not run', {
+        failure: rootResult.failure,
+        dir: identityDir,
+        path_env: process.env.PATH || null,
+      });
+      return deferredGitContext(sessionDir, rootResult.failure);
+    }
+
+    // git ran and the session dir is genuinely not a repository. If the tool
+    // touched a file inside some other repo, that repo's root still wins.
+    if (fileDir && fileDir !== identityDir) {
+      const fileRootResult = gitExecClassified(fileDir, 'git rev-parse --show-toplevel');
+      if (fileRootResult.ok) {
+        const gitContext = buildRepoGitContext(fileRootResult.stdout);
+        saveCachedGitContext(identityDir, gitContext);
+        return gitContext;
+      }
+    }
+
+    // Legitimate non-git project — but only the session-start cwd may name
+    // it, never a file-path-derived subfolder, never a remote sandbox cwd.
+    if (!sessionDir || remote || isGuardedRoot(sessionDir)) {
+      return deferredGitContext(sessionDir, remote ? 'remote_non_git' : 'unnameable_dir');
+    }
+
+    const gitContext = {
+      workspaceFingerprint: fingerprintPath(sessionDir),
+      repoUrl: null,
+      repoFullName: null,
+      repoName: path.basename(sessionDir) || null,
+      branch: null,
+      gitRoot: null,
+      workspacePath: sessionDir,
+      resolution: 'cwd',
+      resolutionFailure: null,
+    };
+    saveCachedGitContext(identityDir, gitContext);
     return gitContext;
+  }
+
+  // Stamp the installed plugin version onto every tick's ai_tool so the backend
+  // persists it in activity_logs.activity_context — makes "which version is a
+  // user running" queryable from the DB and lets us verify a release propagated.
+  function stampPluginVersion(body) {
+    if (!body || !Array.isArray(body.ticks)) return;
+    for (const tick of body.ticks) {
+      const aiTool = tick && tick.activity_context && tick.activity_context.ai_tool;
+      if (aiTool && typeof aiTool === 'object' && aiTool.plugin_version === undefined) {
+        aiTool.plugin_version = pluginVersion;
+      }
+    }
   }
 
   function callEdgeFunction(apiKey, fnName, body) {
     return new Promise((resolve, reject) => {
       const url = new URL(`/functions/v1/${fnName}`, SUPABASE_URL);
+      if (fnName === 'track-tick') stampPluginVersion(body);
       const data = JSON.stringify(body);
 
       const req = https.request(
@@ -265,6 +436,7 @@ function createPluginRuntime(options) {
             'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
             'x-devclocked-key': apiKey,
             'x-devclocked-source': source,
+            'x-devclocked-plugin-version': pluginVersion,
             'Content-Length': Buffer.byteLength(data),
           },
           timeout: 10_000,
@@ -495,6 +667,7 @@ function createPluginRuntime(options) {
     appendLog,
     acquireShipperLock,
     callEdgeFunction,
+    classifyGitFailure,
     discardEnvelope,
     enqueueHookEvent,
     ensureDir,
@@ -513,8 +686,10 @@ function createPluginRuntime(options) {
     saveStreamState,
     shouldRetryEnvelope,
     shouldThrottle,
+    pruneStaleStreamState,
     wakeShipper,
     writeJsonFile,
+    pluginVersion,
   };
 }
 

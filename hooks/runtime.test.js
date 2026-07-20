@@ -117,3 +117,75 @@ test('isTrackTickProcessed rejects accepted but unprocessed responses', () => {
     body: JSON.stringify({ processed_count: 0, session_updated: true }),
   }), true);
 });
+
+// DEV-674: deferred git resolution must ship with NO project name, and
+// workspace_path follows the resolved workspace root (git root or session cwd).
+const runtimeExports = require('./runtime');
+
+const dev674Stream = {
+  streamId: 's-674',
+  parentStreamId: null,
+  rootStreamId: 's-674',
+  throttleId: 's-674',
+  isSubagent: false,
+  isParallel: false,
+  subagentType: null,
+  gitBranch: null,
+  task: null,
+};
+
+test('resolveRepo mirrors the git context and never basename-guesses on deferral (DEV-674)', () => {
+  const named = runtimeExports.resolveRepo(
+    { cwd: '/users/dev/projects/example/sub' },
+    dev674Stream,
+    { resolution: 'git', repoName: 'example', branch: 'main' }
+  );
+  assert.deepEqual(named, { branch: 'main', repo_name: 'example' });
+
+  const deferred = runtimeExports.resolveRepo(
+    { cwd: '/users/dev/projects/example/sub' },
+    dev674Stream,
+    { resolution: 'deferred', repoName: null, branch: null }
+  );
+  assert.deepEqual(deferred, { branch: null, repo_name: null });
+});
+
+test('buildTrackTickRequest ships workspace_path from a cwd-resolved workspace with no git root (DEV-674)', () => {
+  const payload = buildTrackTickRequest(
+    'UserPromptSubmit',
+    { thread_id: 't-674' },
+    dev674Stream,
+    { branch: null, repo_name: 'my-notes' },
+    {
+      repoUrl: null,
+      repoFullName: null,
+      workspaceFingerprint: 'fp-674',
+      gitRoot: null,
+      workspacePath: '/users/dev/plain/my-notes',
+      resolution: 'cwd',
+    }
+  );
+  assert.equal(payload.workspace_path, '/users/dev/plain/my-notes');
+  assert.equal(payload.workspace_fingerprint, 'fp-674');
+});
+
+test('deferred resolution ships no workspace_path, no fingerprint, no project name (DEV-674)', () => {
+  const payload = buildTrackTickRequest(
+    'UserPromptSubmit',
+    { thread_id: 't-675' },
+    dev674Stream,
+    { branch: null, repo_name: null },
+    {
+      repoUrl: null,
+      repoFullName: null,
+      workspaceFingerprint: null,
+      gitRoot: null,
+      workspacePath: null,
+      resolution: 'deferred',
+      resolutionFailure: 'git_unavailable',
+    }
+  );
+  assert.equal(payload.workspace_path, undefined);
+  assert.equal(payload.workspace_fingerprint, undefined);
+  assert.equal(payload.ticks[0].project_name, undefined);
+});
