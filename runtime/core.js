@@ -34,7 +34,14 @@ function readPluginVersion(shipperPath) {
 }
 
 function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+  // 0700: these dirs live under ~/.config/devclocked and hold queued hook
+  // payloads, stream state and cached git context — user-private only (DEV-715).
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dirPath, 0o700);
+  } catch {
+    // best-effort — non-POSIX platforms have no meaningful mode.
+  }
 }
 
 function safeId(value) {
@@ -43,7 +50,120 @@ function safeId(value) {
 
 function writeJsonFile(filePath, value) {
   ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+  // 0600: queue envelopes and state can carry file paths and identifiers —
+  // owner read/write only (DEV-715).
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // best-effort — non-POSIX platforms have no meaningful mode.
+  }
+}
+
+/**
+ * Strip embedded credentials from a git remote URL before it becomes the
+ * shipped repo_url (DEV-707). `https://user:ghp_xxx@github.com/o/r.git` carries
+ * a live token; blank the userinfo, keep everything else untouched.
+ */
+function sanitizeRepoUrl(url) {
+  if (!url) return url;
+  const raw = String(url).trim();
+  if (!raw) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.username || parsed.password) {
+      parsed.username = '';
+      parsed.password = '';
+      return parsed.toString();
+    }
+    return raw;
+  } catch {
+    return raw.replace(/\/\/[^@/]+@/, '//');
+  }
+}
+
+// Top-level hook-input fields the shippers actually read (resolveStream,
+// resolveRepo, classifyActivity, resolveModel, buildTrackTickRequest across the
+// codex + cursor plugins). Everything else — raw prompts, full tool payloads,
+// transcripts — is dropped before the envelope is written to disk (DEV-715).
+const HOOK_INPUT_SCALAR_FIELDS = [
+  'hook_event_name',
+  'timestamp',
+  // stream / session identity
+  'session_id',
+  'conversation_id',
+  'parent_conversation_id',
+  'thread_id',
+  'turn_id',
+  'prompt_id',
+  'request_id',
+  'call_id',
+  'tool_call_id',
+  'message_id',
+  'id',
+  'generation_id',
+  'interaction_id',
+  'composer_id',
+  'subagent_id',
+  // classification / repo hints
+  'tool_name',
+  'file_path',
+  'git_branch',
+  'model',
+  'subagent_type',
+  'task',
+  'is_parallel_worker',
+  // git-context working-dir hint
+  'cwd',
+];
+
+// countEditLines only needs the newline count of each edit string. Preserve the
+// count exactly while discarding the actual code by substituting a newline-only
+// placeholder, so raw diff text never lands on disk.
+function newlinePlaceholder(value) {
+  const count = typeof value === 'string' ? value.split('\n').length : 1;
+  return '\n'.repeat(Math.max(0, count - 1));
+}
+
+function sanitizeHookInput(input) {
+  if (!input || typeof input !== 'object') return input;
+  const clean = {};
+  for (const key of HOOK_INPUT_SCALAR_FIELDS) {
+    if (input[key] !== undefined) clean[key] = input[key];
+  }
+  // Container fields: keep only the leaf keys the shippers read, never the raw
+  // content they also carry (Write bodies, command args, diff text).
+  if (input.tool && typeof input.tool === 'object') {
+    clean.tool = { name: input.tool.name };
+  }
+  if (input.payload && typeof input.payload === 'object') {
+    clean.payload = { tool_name: input.payload.tool_name, name: input.payload.name };
+  }
+  if (input.tool_input && typeof input.tool_input === 'object') {
+    clean.tool_input = { file_path: input.tool_input.file_path };
+  }
+  if (input.devclocked_capture && typeof input.devclocked_capture === 'object') {
+    clean.devclocked_capture = { remote: input.devclocked_capture.remote };
+  }
+  if (Array.isArray(input.workspace_roots)) {
+    clean.workspace_roots = input.workspace_roots.filter((r) => typeof r === 'string');
+  }
+  if (Array.isArray(input.modified_files)) {
+    // Only modified_files[0] is read, and only as a directory path.
+    clean.modified_files = input.modified_files.filter((r) => typeof r === 'string').slice(0, 1);
+  }
+  // Only the leading binary token is used (cursor shell entity); drop the
+  // arguments, which can carry secrets.
+  if (typeof input.command === 'string') {
+    clean.command = input.command.split(/\s/)[0];
+  }
+  if (Array.isArray(input.edits)) {
+    clean.edits = input.edits.map((edit) => ({
+      new_string: newlinePlaceholder(edit && edit.new_string),
+      old_string: newlinePlaceholder(edit && edit.old_string),
+    }));
+  }
+  return clean;
 }
 
 function readJsonFile(filePath) {
@@ -294,7 +414,7 @@ function createPluginRuntime(options) {
   }
 
   function buildRepoGitContext(gitRoot) {
-    const repoUrl = gitExec(gitRoot, 'git remote get-url origin');
+    const repoUrl = sanitizeRepoUrl(gitExec(gitRoot, 'git remote get-url origin'));
     const repoFullName = parseRepoFullName(repoUrl);
     const branch = gitExec(gitRoot, 'git rev-parse --abbrev-ref HEAD');
     const repoName = repoFullName ? repoFullName.split('/').pop() : path.basename(gitRoot);
@@ -485,7 +605,7 @@ function createPluginRuntime(options) {
       id: randomUUID(),
       captured_at: new Date().toISOString(),
       attempts: 0,
-      input,
+      input: sanitizeHookInput(input),
     };
     const filePath = nextQueueFilePath();
     writeJsonFile(filePath, envelope);

@@ -244,3 +244,53 @@ test('pluginVersion option is exposed on the runtime (catch-up from 2026-07-05 g
   const runtime = makeRuntime(() => '');
   assert.equal(runtime.pluginVersion, '0.0.0-test');
 });
+
+test('repo_url with embedded credentials is stripped before it reaches context', () => {
+  const repoRoot = makeDirs('projects', 'secretrepo');
+  const runtime = makeRuntime(
+    repoExec(repoRoot, 'https://user:ghp_LIVETOKEN123@github.com/acme/secretrepo.git')
+  );
+
+  const context = runtime.resolveGitContext({ cwd: repoRoot });
+
+  assert.equal(context.resolution, 'git');
+  assert.ok(!context.repoUrl.includes('ghp_LIVETOKEN123'), 'token must not survive');
+  assert.ok(!context.repoUrl.includes('@'), 'userinfo must be blanked');
+  assert.equal(context.repoUrl, 'https://github.com/acme/secretrepo.git');
+  assert.equal(context.repoFullName, 'acme/secretrepo');
+});
+
+test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', () => {
+  const runtime = makeRuntime(() => '');
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'afterFileEdit',
+    session_id: 'sess-1',
+    file_path: '/tmp/project/src/app.ts',
+    tool_name: 'Write',
+    tool_input: { file_path: '/tmp/project/src/app.ts', content: 'const SECRET = "sk-live-xyz";' },
+    command: 'aws s3 cp secret.txt s3://bucket --key AKIASECRET',
+    prompt: 'my private prompt with confidential business plans',
+    edits: [{ old_string: 'a\nb\nc', new_string: 'a\nb\nc\nd\ne' }],
+  });
+
+  const raw = fs.readFileSync(filePath, 'utf-8');
+  assert.ok(!raw.includes('SECRET'), 'raw Write content must not be on disk');
+  assert.ok(!raw.includes('AKIASECRET'), 'command args must not be on disk');
+  assert.ok(!raw.includes('confidential'), 'raw prompt must not be on disk');
+  assert.ok(!raw.includes('prompt'), 'prompt field must be dropped entirely');
+
+  const envelope = JSON.parse(raw);
+  // Consumed fields survive.
+  assert.equal(envelope.input.hook_event_name, 'afterFileEdit');
+  assert.equal(envelope.input.file_path, '/tmp/project/src/app.ts');
+  assert.equal(envelope.input.tool_input.file_path, '/tmp/project/src/app.ts');
+  assert.equal(envelope.input.command, 'aws');
+  // Edit line counts are preserved for countEditLines (old=3 lines, new=5 lines).
+  assert.equal(envelope.input.edits[0].old_string.split('\n').length, 3);
+  assert.equal(envelope.input.edits[0].new_string.split('\n').length, 5);
+
+  if (process.platform !== 'win32') {
+    const mode = fs.statSync(filePath).mode & 0o777;
+    assert.equal(mode, 0o600, `queue file must be 0600, got ${mode.toString(8)}`);
+  }
+});
