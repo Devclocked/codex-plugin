@@ -143,7 +143,17 @@ function sanitizeHookInput(input) {
     clean.tool_input = { file_path: input.tool_input.file_path };
   }
   if (input.devclocked_capture && typeof input.devclocked_capture === 'object') {
-    clean.devclocked_capture = { remote: input.devclocked_capture.remote };
+    // Our own capture envelope, stamped by track.js from env — the sanitizer
+    // exists to strip the host tool's payload, not this namespace. Preserve
+    // scalar leaves by type so no future capture key can be silently truncated
+    // by any copy; nested values still get dropped (DEV-817).
+    const capture = {};
+    for (const [key, value] of Object.entries(input.devclocked_capture)) {
+      if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+        capture[key] = value;
+      }
+    }
+    clean.devclocked_capture = capture;
   }
   if (Array.isArray(input.workspace_roots)) {
     clean.workspace_roots = input.workspace_roots.filter((r) => typeof r === 'string');
