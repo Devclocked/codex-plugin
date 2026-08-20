@@ -619,17 +619,30 @@ test('the once-per-run sweep clears orphaned .tmp files past the age cap (DEV-93
 test('a failed write leaves no temp file behind (DEV-936 R2)', () => {
   const runtime = makeRuntime(() => '');
   runtime.ensureDir(runtime.QUEUE_DIR);
-  // A directory where the file should go: writeFileSync throws EISDIR.
   const target = path.join(runtime.QUEUE_DIR, 'blocked.json');
-  fs.mkdirSync(`${target}.${process.pid}.tmp`, { recursive: true });
+  const tmpPath = `${target}.${process.pid}.tmp`;
 
-  assert.throws(() => runtime.writeJsonFile(target, { id: 'x' }));
-  assert.equal(fs.existsSync(target), false);
+  // Model an ENOSPC that lands part-way through: the temp file exists on disk
+  // by the time the write throws. That is the orphan nothing else would ever
+  // clean up — and an orphan in the dead-letter dir is invisible to the 5 MB
+  // ceiling. Only a write that is itself inside the try can unlink it.
+  const realWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = (filePath, ...rest) => {
+    realWriteFileSync(filePath, ...rest);
+    if (filePath === tmpPath) throw new Error('ENOSPC: no space left on device');
+    return undefined;
+  };
 
-  fs.rmSync(`${target}.${process.pid}.tmp`, { recursive: true, force: true });
+  try {
+    assert.throws(() => runtime.writeJsonFile(target, { id: 'x' }), /ENOSPC/);
+  } finally {
+    fs.writeFileSync = realWriteFileSync;
+  }
+
+  assert.equal(fs.existsSync(target), false, 'a failed write must not publish');
+  assert.equal(fs.existsSync(tmpPath), false, 'no orphan may survive a failed write');
   assert.deepEqual(
     fs.readdirSync(runtime.QUEUE_DIR).filter((name) => name.endsWith('.tmp')),
-    [],
-    'no orphan may survive a failed write'
+    []
   );
 });

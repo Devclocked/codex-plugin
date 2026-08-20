@@ -3,7 +3,7 @@
     {
       "id": "devclocked-codex",
       "name": "DevClocked",
-      "version": "1.0.5",
+      "version": "1.0.6",
       "description": "Automatic time tracking for Codex with live hooks and DevClocked activity tools.",
       "source": {
         "path": "."
