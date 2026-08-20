@@ -97,8 +97,31 @@ function classifyActivity(hookEvent, input, stream) {
   }
 }
 
-function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
-  const now = typeof input.timestamp === 'string' ? input.timestamp : new Date().toISOString();
+// Ship-time values used to leak into every tick: `now` and request_key were
+// derived from Date.now() when the shipper ran, so re-sending the same queued
+// envelope minted a NEW request_key and the backend counted the activity twice.
+// The dead-letter replay (DEV-936) makes re-sending routine, so both are now
+// pure functions of the envelope — its capture instant and its id, both fixed
+// when the hook fired. A tick replayed six days later is also recorded at the
+// moment it happened rather than at reconnect time.
+// Codex hook input carries its own event timestamp, and it is the most accurate
+// clock available — it keeps the precedence it had before DEV-936. It is fixed
+// in the envelope at enqueue time, so it is replay-stable either way;
+// captured_at is the fallback for hooks that send no timestamp.
+function tickInstant(input, envelope) {
+  if (typeof input.timestamp === 'string' && Number.isFinite(Date.parse(input.timestamp))) {
+    return input.timestamp;
+  }
+  const capturedAt = Date.parse(envelope?.captured_at);
+  if (Number.isFinite(capturedAt)) return new Date(capturedAt).toISOString();
+  return new Date().toISOString();
+}
+
+function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope) {
+  const now = tickInstant(input, envelope);
+  // Stable per queued envelope, so a replay collides with the original on the
+  // backend's request_key instead of registering as new activity.
+  const requestKeyId = envelope?.id || now;
   const toolName = normalizedToolName(input);
 
   let entity = `codex://${hookEvent}`;
@@ -127,7 +150,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
   let runtimeMs = 5_000;
   if (hookEvent === 'Stop') {
     const priorState = runtime.getStreamState(streamStateId(stream));
-    const elapsed = priorState && priorState.last_tick_at ? Date.now() - priorState.last_tick_at : null;
+    const elapsed = priorState && priorState.last_tick_at ? Date.parse(now) - priorState.last_tick_at : null;
     if (Number.isFinite(elapsed) && elapsed > 0) runtimeMs = elapsed;
   }
   const runtimeEndedAt = new Date(new Date(now).getTime() + runtimeMs).toISOString();
@@ -154,7 +177,7 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext) {
         timestamp: now,
         session_file_id: sessionFileId,
         run_id: runId,
-        request_key: `${runId}:${hookEvent}:${stream.streamId}:${now}`,
+        request_key: `${runId}:${hookEvent}:${stream.streamId}:${requestKeyId}`,
         runtime_ms: runtimeMs,
         runtime_started_at: now,
         runtime_ended_at: runtimeEndedAt,

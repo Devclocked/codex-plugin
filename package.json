@@ -1,12 +1,12 @@
 {
   "name": "@devclocked/codex-plugin",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "license": "MIT",
   "scripts": {
     "doctor": "node scripts/manage-hooks.js doctor",
     "install-hooks": "node scripts/manage-hooks.js install",
-    "test": "node --test runtime/core.test.js runtime/ship.test.js hooks/runtime.test.js hooks/ship.test.js scripts/manage-hooks.test.js",
+    "test": "node --test runtime/core.test.js runtime/ship.test.js runtime/status.test.js hooks/runtime.test.js hooks/ship.test.js scripts/manage-hooks.test.js",
     "uninstall-hooks": "node scripts/manage-hooks.js uninstall"
   }
 }

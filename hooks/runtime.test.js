@@ -189,3 +189,109 @@ test('deferred resolution ships no workspace_path, no fingerprint, no project na
   assert.equal(payload.workspace_fingerprint, undefined);
   assert.equal(payload.ticks[0].project_name, undefined);
 });
+
+// --- DEV-936 F1: the payload must be a pure function of the queued envelope ---
+// Envelopes queue RAW hook input, so the payload is assembled at SHIP time. When
+// request_key and timestamp came from Date.now() at that moment, re-sending the
+// same envelope minted a fresh request_key and the backend counted the activity
+// twice — the dead-letter replay had no idempotency to rely on.
+
+const IDEMPOTENCY_ENVELOPE = {
+  id: '0f8c4a1e-1111-4222-8333-444455556666',
+  captured_at: '2026-08-14T07:00:00.000Z',
+};
+
+function buildTwice(hookEvent, input, stream, envelope) {
+  const repo = { repo_name: 'widget', branch: 'main' };
+  const gitContext = { repoUrl: null, repoFullName: null, workspaceFingerprint: null, workspacePath: null, gitRoot: null };
+  const first = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
+  const second = buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope);
+  return [first.ticks[0].activity_context.ai_tool, second.ticks[0].activity_context.ai_tool];
+}
+
+test('the same envelope built twice yields an identical request_key and timestamp (DEV-936)', () => {
+  const input = { thread_id: 'thread-936-idem', turn_id: 'turn-1', tool_name: 'Bash' };
+  const stream = { streamId: 'turn-1', parentStreamId: null, rootStreamId: 'thread-936-idem', isSubagent: false };
+
+  const [first] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  // Rebuild after wall-clock time has moved on, which is exactly what a replay
+  // hours or days later does.
+  const before = Date.now;
+  Date.now = () => before() + 90_000;
+  let second;
+  try {
+    [, second] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  } finally {
+    Date.now = before;
+  }
+
+  assert.equal(first.request_key, second.request_key, 'request_key must not move with ship time');
+  assert.equal(first.timestamp, second.timestamp, 'timestamp must not move with ship time');
+  assert.equal(first.runtime_started_at, second.runtime_started_at);
+  assert.equal(first.runtime_ended_at, second.runtime_ended_at);
+});
+
+test('the tick is stamped at capture time, not at reconnect time (DEV-936)', () => {
+  const input = { thread_id: 'thread-936-idem', turn_id: 'turn-1', tool_name: 'Bash' };
+  const stream = { streamId: 'turn-1', parentStreamId: null, rootStreamId: 'thread-936-idem', isSubagent: false };
+
+  const [aiTool] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+
+  // A six-day-old replayed tick must be recorded when it happened.
+  assert.equal(aiTool.timestamp, IDEMPOTENCY_ENVELOPE.captured_at);
+  assert.equal(aiTool.runtime_started_at, IDEMPOTENCY_ENVELOPE.captured_at);
+  assert.ok(
+    aiTool.request_key.includes(IDEMPOTENCY_ENVELOPE.id),
+    `request_key must be keyed on the envelope id, got ${aiTool.request_key}`
+  );
+});
+
+test('two distinct envelopes for the same stream still get distinct request_keys (DEV-936)', () => {
+  const input = { thread_id: 'thread-936-idem', turn_id: 'turn-1', tool_name: 'Bash' };
+  const stream = { streamId: 'turn-1', parentStreamId: null, rootStreamId: 'thread-936-idem', isSubagent: false };
+
+  const [a] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  const [b] = buildTwice('PostToolUse', input, stream, {
+    id: '99999999-1111-4222-8333-444455556666',
+    captured_at: IDEMPOTENCY_ENVELOPE.captured_at,
+  });
+
+  assert.notEqual(a.request_key, b.request_key);
+});
+
+test('an envelope-less build still works and falls back to ship time (DEV-936)', () => {
+  const input = { thread_id: 'thread-936-idem', turn_id: 'turn-1', tool_name: 'Bash' };
+  const stream = { streamId: 'turn-1', parentStreamId: null, rootStreamId: 'thread-936-idem', isSubagent: false };
+
+  const [aiTool] = buildTwice('PostToolUse', input, stream, undefined);
+
+  assert.ok(aiTool.request_key, 'the legacy 5-arg call must not throw');
+  assert.ok(Number.isFinite(Date.parse(aiTool.timestamp)));
+});
+
+test('the Codex hook event timestamp keeps precedence over captured_at and stays replay-stable (DEV-936)', () => {
+  const input = {
+    thread_id: 'thread-936-r3',
+    turn_id: 'turn-1',
+    tool_name: 'Bash',
+    timestamp: '2026-04-18T10:00:00.000Z',
+  };
+  const stream = { streamId: 'turn-1', parentStreamId: null, rootStreamId: 'thread-936-r3', isSubagent: false };
+
+  const [first] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  const before = Date.now;
+  Date.now = () => before() + 90_000;
+  let second;
+  try {
+    [, second] = buildTwice('PostToolUse', input, stream, IDEMPOTENCY_ENVELOPE);
+  } finally {
+    Date.now = before;
+  }
+
+  // The hook's own event time is the most accurate clock we get, and it is
+  // frozen in the envelope, so precedence costs nothing in replay stability.
+  assert.equal(first.timestamp, '2026-04-18T10:00:00.000Z');
+  assert.notEqual(first.timestamp, IDEMPOTENCY_ENVELOPE.captured_at);
+  assert.equal(first.timestamp, second.timestamp);
+  assert.equal(first.request_key, second.request_key);
+});

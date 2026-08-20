@@ -325,3 +325,311 @@ test('acquireShipperLock reclaims an empty lock file whose mtime is older than L
   runtime.releaseShipperLock(fd);
   assert.equal(fs.existsSync(runtime.SHIPPER_LOCK_PATH), false);
 });
+
+// --- DEV-936: dead-letter store instead of dropping exhausted envelopes ------
+// Design ported from tracker-core DEV-826. Every runtime in this file shares one
+// namespace, so each test starts from an empty dead-letter dir.
+
+function clearDeadLetter(runtime) {
+  for (const filePath of runtime.listDeadLetterFiles()) fs.unlinkSync(filePath);
+}
+
+function writeDeadLetterEntry(runtime, name, ageMs, padBytes = 0) {
+  fs.mkdirSync(runtime.DEAD_LETTER_DIR, { recursive: true });
+  const filePath = path.join(runtime.DEAD_LETTER_DIR, name);
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      id: name,
+      captured_at: new Date(Date.now() - ageMs).toISOString(),
+      attempts: 5,
+      dead_lettered_at: new Date().toISOString(),
+      dead_letter_reason: 'max_attempts:edge_function_503',
+      input: { hook_event_name: 'afterFileEdit', session_id: name, pad: 'x'.repeat(padBytes) },
+    })
+  );
+  return filePath;
+}
+
+test('an exhausted envelope moves into the dead-letter dir instead of being unlinked (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const filePath = runtime.enqueueHookEvent({
+    hook_event_name: 'afterFileEdit',
+    session_id: 'sess-936-move',
+  });
+  const envelope = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+  const parked = runtime.deadLetterEnvelope(filePath, envelope, 'max_attempts:edge_function_503');
+
+  assert.equal(parked, path.join(runtime.DEAD_LETTER_DIR, path.basename(filePath)));
+  assert.equal(fs.existsSync(filePath), false, 'the envelope must leave the live queue');
+  assert.equal(fs.existsSync(parked), true, 'the envelope must survive on disk');
+
+  const stored = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  assert.ok(stored.dead_lettered_at, 'dead_lettered_at must be stamped');
+  assert.equal(stored.dead_letter_reason, 'max_attempts:edge_function_503');
+  assert.deepEqual(stored.input, envelope.input, 'the payload must survive untouched');
+
+  // The dead-letter dir is a sibling of the queue dir, so the live drain keeps
+  // ignoring parked envelopes until a replay puts them back.
+  assert.deepEqual(runtime.listDeadLetterFiles(), [parked]);
+  assert.ok(runtime.listQueueFiles().every((queued) => !queued.startsWith(runtime.DEAD_LETTER_DIR)));
+
+  clearDeadLetter(runtime);
+});
+
+test('dead-letter pruning evicts entries past the 7-day age cap and keeps younger ones (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  assert.equal(runtime.DEAD_LETTER_MAX_AGE_MS, 7 * 24 * 60 * 60 * 1000);
+
+  const eightDaysOld = writeDeadLetterEntry(runtime, 'aged-out.json', 8 * 24 * 60 * 60 * 1000);
+  const sixDaysOld = writeDeadLetterEntry(runtime, 'still-young.json', 6 * 24 * 60 * 60 * 1000);
+
+  assert.equal(runtime.pruneDeadLetter(), 1);
+  assert.equal(fs.existsSync(eightDaysOld), false);
+  assert.equal(fs.existsSync(sixDaysOld), true);
+
+  clearDeadLetter(runtime);
+});
+
+test('dead-letter pruning evicts oldest-first until the byte ceiling is met (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  assert.equal(runtime.DEAD_LETTER_MAX_BYTES, 5 * 1024 * 1024);
+
+  const oldest = writeDeadLetterEntry(runtime, 'a-oldest.json', 30 * 60_000, 3000);
+  const middle = writeDeadLetterEntry(runtime, 'b-middle.json', 20 * 60_000, 3000);
+  const newest = writeDeadLetterEntry(runtime, 'c-newest.json', 10 * 60_000, 3000);
+
+  // A ceiling only the newest entry fits under: the two older ones must go, in
+  // age order, and eviction must stop as soon as the store is under the cap.
+  const maxBytes = fs.statSync(newest).size;
+  assert.equal(runtime.pruneDeadLetter(Date.now(), { maxBytes }), 2);
+
+  assert.equal(fs.existsSync(oldest), false);
+  assert.equal(fs.existsSync(middle), false);
+  assert.equal(fs.existsSync(newest), true, 'the newest entry must survive');
+
+  clearDeadLetter(runtime);
+});
+
+test('every dead-letter eviction is logged — the only path that loses activity is never silent (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const logPath = path.join(runtime.LOG_DIR, 'shipper.log');
+  const before = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8').length : 0;
+
+  writeDeadLetterEntry(runtime, 'loud-eviction.json', 9 * 24 * 60 * 60 * 1000);
+  assert.equal(runtime.pruneDeadLetter(), 1);
+
+  const written = fs.readFileSync(logPath, 'utf-8').slice(before);
+  const entry = written
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((line) => line.extra?.file === 'loud-eviction.json');
+  assert.ok(entry, 'expected an eviction log entry');
+  assert.match(entry.message, /Evicted dead-lettered hook event/);
+  assert.equal(entry.extra.reason, 'max_age');
+
+  clearDeadLetter(runtime);
+});
+
+test('replayDeadLetter returns envelopes to the queue with a clean retry budget (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const parked = writeDeadLetterEntry(runtime, 'replay-me.json', 60_000);
+  const spent = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  spent.retry_after = new Date(Date.now() + 15_000).toISOString();
+  fs.writeFileSync(parked, JSON.stringify(spent));
+
+  assert.equal(runtime.replayDeadLetter(), 1);
+
+  const requeued = path.join(runtime.QUEUE_DIR, 'replay-me.json');
+  assert.equal(fs.existsSync(parked), false);
+  assert.equal(fs.existsSync(requeued), true);
+
+  const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
+  assert.equal(envelope.attempts, 0, 'attempts must reset');
+  assert.equal(envelope.retry_after, undefined, 'the backoff must be cleared');
+  assert.equal(
+    runtime.shouldRetryEnvelope(envelope),
+    true,
+    'a replayed envelope must be immediately eligible'
+  );
+
+  fs.unlinkSync(requeued);
+  clearDeadLetter(runtime);
+});
+
+test('replayDeadLetterFile returns one envelope to the queue with a clean retry budget (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  const parked = writeDeadLetterEntry(runtime, 'replay-one.json', 60_000);
+  const spent = JSON.parse(fs.readFileSync(parked, 'utf-8'));
+  spent.retry_after = new Date(Date.now() + 15_000).toISOString();
+  fs.writeFileSync(parked, JSON.stringify(spent));
+
+  const { queuedPath: requeued, quarantined } = runtime.replayDeadLetterFile(parked);
+
+  assert.equal(quarantined, false);
+  assert.equal(requeued, path.join(runtime.QUEUE_DIR, 'replay-one.json'));
+  assert.equal(fs.existsSync(parked), false);
+  const envelope = JSON.parse(fs.readFileSync(requeued, 'utf-8'));
+  assert.equal(envelope.attempts, 0, 'attempts must reset');
+  assert.equal(envelope.retry_after, undefined, 'the backoff must be cleared');
+  assert.equal(runtime.shouldRetryEnvelope(envelope), true);
+
+  fs.unlinkSync(requeued);
+  clearDeadLetter(runtime);
+});
+
+test('replayDeadLetter moves at most the replay limit, oldest first (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  for (let i = 0; i < 30; i += 1) {
+    writeDeadLetterEntry(runtime, `bulk-${String(i).padStart(3, '0')}.json`, (30 - i) * 60_000);
+  }
+
+  assert.equal(runtime.DEAD_LETTER_REPLAY_LIMIT, 25);
+  assert.equal(runtime.replayDeadLetter(), 25);
+  assert.equal(runtime.listDeadLetterFiles().length, 5, 'the rest wait for the next run');
+
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+  clearDeadLetter(runtime);
+});
+
+test('an unreadable queue file is quarantined out of both globs instead of wedging the drain (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const corrupt = path.join(runtime.QUEUE_DIR, 'truncated.json');
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  fs.writeFileSync(corrupt, '{"id":"half-writ');
+  assert.throws(() => runtime.readJsonFile(corrupt));
+
+  assert.equal(runtime.quarantineEnvelope(corrupt, new SyntaxError('Unexpected end of JSON input')), true);
+
+  assert.equal(fs.existsSync(corrupt), false);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, 'truncated.json')), true);
+  assert.deepEqual(runtime.listQueueFiles(), [], 'a corrupt file must not be re-listed');
+  assert.deepEqual(runtime.listDeadLetterFiles(), [], 'and it is not replayable either');
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+});
+
+test('a dead-lettered envelope that will not parse is quarantined rather than replayed forever (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.DEAD_LETTER_DIR);
+  const parked = path.join(runtime.DEAD_LETTER_DIR, 'corrupt-parked.json');
+  fs.writeFileSync(parked, '{"captured_at":');
+
+  assert.deepEqual(runtime.replayDeadLetterFile(parked), { queuedPath: null, quarantined: true });
+  assert.equal(fs.existsSync(parked), false);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, 'corrupt-parked.json')), true);
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+  clearDeadLetter(runtime);
+});
+
+test('writeJsonFile publishes by rename, so a reader never sees a partial envelope (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const filePath = runtime.enqueueHookEvent({ hook_event_name: 'afterFileEdit', session_id: 'sess-atomic' });
+
+  // Every intermediate write lands on a .tmp name that neither glob matches,
+  // and nothing is left behind once the rename completes.
+  const residue = fs.readdirSync(runtime.QUEUE_DIR).filter((name) => name.endsWith('.tmp'));
+  assert.deepEqual(residue, []);
+  assert.doesNotThrow(() => runtime.readJsonFile(filePath));
+
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(filePath).mode & 0o777, 0o600, 'the rename must preserve 0600');
+  }
+
+  fs.unlinkSync(filePath);
+});
+
+test('a queue file that parses fine is left in place when processing fails for another reason (DEV-936)', () => {
+  const runtime = makeRuntime(() => '');
+  for (const filePath of runtime.listQueueFiles()) fs.unlinkSync(filePath);
+
+  const filePath = runtime.enqueueHookEvent({ hook_event_name: 'afterFileEdit', session_id: 'sess-transient' });
+
+  // A transient write failure must not relocate captured activity.
+  assert.equal(runtime.quarantineEnvelope(filePath, new Error('EROFS: read-only file system')), false);
+  assert.equal(fs.existsSync(filePath), true);
+  assert.equal(fs.existsSync(path.join(runtime.QUARANTINE_DIR, path.basename(filePath))), false);
+
+  fs.unlinkSync(filePath);
+});
+
+test('the once-per-run sweep clears quarantined files past the age cap (DEV-936 R1)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.QUARANTINE_DIR);
+
+  const aged = path.join(runtime.QUARANTINE_DIR, 'aged.json');
+  const fresh = path.join(runtime.QUARANTINE_DIR, 'fresh.json');
+  fs.writeFileSync(aged, '{"broken');
+  fs.writeFileSync(fresh, '{"broken');
+  const eightDaysAgo = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(aged, eightDaysAgo, eightDaysAgo);
+
+  runtime.pruneDeadLetter();
+
+  assert.equal(fs.existsSync(aged), false, 'the quarantine store must not grow forever');
+  assert.equal(fs.existsSync(fresh), true, 'a recent one stays around to be diagnosed');
+
+  fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+});
+
+test('the once-per-run sweep clears orphaned .tmp files past the age cap (DEV-936 R2)', () => {
+  const runtime = makeRuntime(() => '');
+  clearDeadLetter(runtime);
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  runtime.ensureDir(runtime.DEAD_LETTER_DIR);
+
+  // A write that died between writeFileSync and renameSync.
+  const orphans = [
+    path.join(runtime.QUEUE_DIR, '123-4-abc.json.99.tmp'),
+    path.join(runtime.DEAD_LETTER_DIR, '123-4-def.json.99.tmp'),
+  ];
+  const fresh = path.join(runtime.DEAD_LETTER_DIR, '123-4-ghi.json.99.tmp');
+  for (const filePath of [...orphans, fresh]) fs.writeFileSync(filePath, 'x'.repeat(1000));
+  const eightDaysAgo = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  for (const filePath of orphans) fs.utimesSync(filePath, eightDaysAgo, eightDaysAgo);
+
+  runtime.pruneDeadLetter();
+
+  for (const filePath of orphans) assert.equal(fs.existsSync(filePath), false);
+  assert.equal(fs.existsSync(fresh), true, 'a fresh temp file may belong to a live write');
+  // Either way a .tmp is invisible to both globs, so it can never be shipped.
+  assert.deepEqual(runtime.listQueueFiles(), []);
+  assert.deepEqual(runtime.listDeadLetterFiles(), []);
+
+  fs.unlinkSync(fresh);
+});
+
+test('a failed write leaves no temp file behind (DEV-936 R2)', () => {
+  const runtime = makeRuntime(() => '');
+  runtime.ensureDir(runtime.QUEUE_DIR);
+  // A directory where the file should go: writeFileSync throws EISDIR.
+  const target = path.join(runtime.QUEUE_DIR, 'blocked.json');
+  fs.mkdirSync(`${target}.${process.pid}.tmp`, { recursive: true });
+
+  assert.throws(() => runtime.writeJsonFile(target, { id: 'x' }));
+  assert.equal(fs.existsSync(target), false);
+
+  fs.rmSync(`${target}.${process.pid}.tmp`, { recursive: true, force: true });
+  assert.deepEqual(
+    fs.readdirSync(runtime.QUEUE_DIR).filter((name) => name.endsWith('.tmp')),
+    [],
+    'no orphan may survive a failed write'
+  );
+});

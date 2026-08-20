@@ -1,6 +1,6 @@
 {
   "name": "devclocked-codex",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Automatic time tracking for Codex with live hooks, recovery fallback, and DevClocked activity tools.",
   "author": {
     "name": "DevClocked",
