@@ -36,6 +36,24 @@ function isActivityTypeTransition(priorState, newActivityType) {
   return Boolean(priorState?.last_activity_type) && priorState.last_activity_type !== newActivityType;
 }
 
+// A session-end marker older than the backend's idle authority (20 min) carries
+// no time signal: the backend already closed the session by idle timeout, so
+// shipping it late can only anchor a phantom session at its stale captured_at
+// (DEV-938: an envelope orphaned in the queue for 7h back-dated a new session).
+const STALE_SESSION_END_MS = 20 * 60_000;
+// Anything older than this shipped late for some reason worth seeing in the log.
+const DELAYED_ENVELOPE_MS = 2 * 60_000;
+
+function envelopeAgeMs(envelope, nowMs = Date.now()) {
+  const capturedAt = Date.parse(envelope?.captured_at);
+  if (Number.isNaN(capturedAt)) return 0;
+  return Math.max(0, nowMs - capturedAt);
+}
+
+function isStaleSessionEnd(hookEvent, ageMs) {
+  return hookEvent === 'Stop' && ageMs > STALE_SESSION_END_MS;
+}
+
 function initializeLifecycleState(hookEvent, stream) {
   if (hookEvent === 'SessionStart') {
     saveStreamState(stream.rootStreamId, {
@@ -65,6 +83,21 @@ async function processEnvelope(filePath, apiKey) {
 
   const stream = resolveStream(hookEvent, input);
   initializeLifecycleState(hookEvent, stream);
+
+  const ageMs = envelopeAgeMs(envelope);
+  if (isStaleSessionEnd(hookEvent, ageMs)) {
+    // Backend already closed this session by idle timeout — see STALE_SESSION_END_MS.
+    removeStreamState(stream.rootStreamId);
+    discardEnvelope(filePath, envelope, 'stale_session_end');
+    return;
+  }
+  if (ageMs > DELAYED_ENVELOPE_MS) {
+    appendLog('shipper', 'Shipping delayed hook event', {
+      file: path.basename(filePath),
+      hook_event_name: hookEvent,
+      age_ms: ageMs,
+    });
+  }
 
   const throttleStateId = stream.throttleId || stream.streamId;
   if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
@@ -132,4 +165,12 @@ if (require.main === module) {
   runShipper(runtime, processEnvelope);
 }
 
-module.exports = { isActivityTypeTransition, isLifecycleEvent, processEnvelope };
+module.exports = {
+  DELAYED_ENVELOPE_MS,
+  STALE_SESSION_END_MS,
+  envelopeAgeMs,
+  isActivityTypeTransition,
+  isLifecycleEvent,
+  isStaleSessionEnd,
+  processEnvelope,
+};

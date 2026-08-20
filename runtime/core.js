@@ -652,23 +652,30 @@ function createPluginRuntime(options) {
       return fd;
     } catch (error) {
       if (error.code !== 'EEXIST') return null;
+      let reclaimable = false;
       try {
         const existing = readJsonFile(SHIPPER_LOCK_PATH);
         const stale = !existing.started_at || Date.now() - existing.started_at > LOCK_STALE_MS;
         const dead = !existing.pid || !isProcessAlive(existing.pid);
-        if (stale || dead) {
-          fs.unlinkSync(SHIPPER_LOCK_PATH);
-          return acquireShipperLock();
-        }
+        reclaimable = stale || dead;
       } catch {
+        // Empty or unparsable lock: most likely another shipper is between
+        // openSync('wx') and writeFileSync. Treat it as HELD unless the file
+        // itself is old — unlinking a fresh lock here let two shippers run
+        // concurrently (DEV-938).
         try {
-          fs.unlinkSync(SHIPPER_LOCK_PATH);
-          return acquireShipperLock();
+          reclaimable = Date.now() - fs.statSync(SHIPPER_LOCK_PATH).mtimeMs > LOCK_STALE_MS;
         } catch {
           return null;
         }
       }
-      return null;
+      if (!reclaimable) return null;
+      try {
+        fs.unlinkSync(SHIPPER_LOCK_PATH);
+      } catch {
+        return null;
+      }
+      return acquireShipperLock();
     }
   }
 

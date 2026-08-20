@@ -294,3 +294,34 @@ test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', (
     assert.equal(mode, 0o600, `queue file must be 0600, got ${mode.toString(8)}`);
   }
 });
+
+test('acquireShipperLock treats an empty lock file with a fresh mtime as held (DEV-938)', () => {
+  const runtime = makeRuntime(() => '');
+  fs.mkdirSync(path.dirname(runtime.SHIPPER_LOCK_PATH), { recursive: true });
+  // The window between openSync('wx') and writeFileSync in another shipper.
+  fs.writeFileSync(runtime.SHIPPER_LOCK_PATH, '');
+
+  assert.equal(runtime.acquireShipperLock(), null);
+  assert.equal(fs.existsSync(runtime.SHIPPER_LOCK_PATH), true);
+
+  fs.unlinkSync(runtime.SHIPPER_LOCK_PATH);
+});
+
+test('acquireShipperLock reclaims an empty lock file whose mtime is older than LOCK_STALE_MS (DEV-938)', () => {
+  const runtime = makeRuntime(() => '');
+  fs.mkdirSync(path.dirname(runtime.SHIPPER_LOCK_PATH), { recursive: true });
+  fs.writeFileSync(runtime.SHIPPER_LOCK_PATH, '');
+  // LOCK_STALE_MS is 60s; five minutes is comfortably past it.
+  const oldSeconds = (Date.now() - 5 * 60_000) / 1000;
+  fs.utimesSync(runtime.SHIPPER_LOCK_PATH, oldSeconds, oldSeconds);
+
+  const fd = runtime.acquireShipperLock();
+
+  assert.equal(typeof fd, 'number');
+  const lock = JSON.parse(fs.readFileSync(runtime.SHIPPER_LOCK_PATH, 'utf-8'));
+  assert.equal(lock.pid, process.pid);
+  assert.equal(typeof lock.started_at, 'number');
+
+  runtime.releaseShipperLock(fd);
+  assert.equal(fs.existsSync(runtime.SHIPPER_LOCK_PATH), false);
+});
