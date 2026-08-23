@@ -4,6 +4,10 @@ Codex-native DevClocked tracking plugin.
 
 This plugin makes Codex itself trigger DevClocked tracking, so Codex work keeps tracking even when the DevClocked Mac app is not open. The supported activation path is: install the plugin, then let the plugin install its managed entries into the official Codex hooks surface at `~/.codex/hooks.json`.
 
+For Codex sessions that execute on an SSH server, follow the
+[remote hosting guide](https://github.com/sketchymedia/devclocked-trackers/blob/main/docs/REMOTE_HOSTING.md), including the complete
+Hetzner example and host-local verification steps.
+
 ## What it includes
 
 - Codex hooks for session lifecycle, prompt submissions, and Bash tool activity
