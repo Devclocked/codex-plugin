@@ -2,8 +2,21 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const CODEX_HOME = path.join(process.env.HOME || '~', '.codex');
+// os.homedir() rather than process.env.HOME: Windows sets USERPROFILE only, and
+// the old '~' fallback resolved to a literal "~" directory beside the CWD, so
+// hooks were installed somewhere Codex never reads (DEV-1001).
+function resolveHomeDir() {
+  try {
+    const home = os.homedir();
+    return typeof home === 'string' ? home : '';
+  } catch {
+    return '';
+  }
+}
+
+const CODEX_HOME = path.join(resolveHomeDir() || '~', '.codex');
 const CONFIG_PATH = path.join(CODEX_HOME, 'config.toml');
 const HOOKS_PATH = path.join(CODEX_HOME, 'hooks.json');
 const MANAGED_PREFIX = 'DEVCLOCKED_CODEX_PLUGIN=1';

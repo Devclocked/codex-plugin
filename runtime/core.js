@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const https = require('https');
 const { execSync } = require('child_process');
 const { createHash, randomUUID } = require('crypto');
@@ -7,7 +8,22 @@ const { createHash, randomUUID } = require('crypto');
 const SUPABASE_URL = 'https://api.devclocked.com';
 const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhhcWZna2ttZWdseXJ1bG1waXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIwMDYyODcsImV4cCI6MjA2NzU4MjI4N30.fTonLdDRqqtV44tBcl0Z7ryvaSD5Gczy-OTkzHUw0o4';
-const DEVCLOCKED_HOME = path.join(process.env.HOME || '~', '.config', 'devclocked');
+// Windows sets USERPROFILE, not HOME, so `process.env.HOME` fell through to the
+// literal '~' fallback: every queue/state/log/cache path landed in a directory
+// named "~" beside the CWD and the CLI config was never found (DEV-1001).
+// os.homedir() reads $HOME on POSIX — so tests that sandbox by overriding
+// process.env.HOME still work — and %USERPROFILE% on Windows, with an OS-level
+// lookup when neither is set.
+function resolveHomeDir() {
+  try {
+    const home = os.homedir();
+    return typeof home === 'string' ? home : '';
+  } catch {
+    return '';
+  }
+}
+
+const DEVCLOCKED_HOME = path.join(resolveHomeDir() || '~', '.config', 'devclocked');
 const CLI_CONFIG_PATH = path.join(DEVCLOCKED_HOME, 'cli.json');
 const PLUGIN_ACTIVITY_DIR = path.join(DEVCLOCKED_HOME, 'plugin-activity');
 
@@ -341,7 +357,7 @@ function createPluginRuntime(options) {
     if (!maybePath || typeof maybePath !== 'string') return null;
     const candidate = path.isAbsolute(maybePath)
       ? maybePath
-      : path.join(process.env.HOME || '/', maybePath);
+      : path.join(resolveHomeDir() || '/', maybePath);
     try {
       const stat = fs.statSync(candidate);
       if (stat.isDirectory()) return candidate;
@@ -489,7 +505,7 @@ function createPluginRuntime(options) {
       // fall through with the raw path
     }
     const normalized = resolved.replace(/\/+$/, '') || '/';
-    let home = process.env.HOME || '';
+    let home = resolveHomeDir();
     try {
       if (home) home = fs.realpathSync(home);
     } catch {
