@@ -48,46 +48,57 @@ function writeJson(filePath, value) {
 
 function ensureCodexHooksFeature(configText) {
   const source = typeof configText === 'string' ? configText : '';
-  if (/\bcodex_hooks\s*=\s*true\b/.test(source)) {
-    return {
-      changed: false,
-      text: source || '[features]\ncodex_hooks = true\n',
-    };
-  }
-
-  const lines = source.length ? source.split('\n') : [];
+  const lines = source.length ? source.replace(/\n+$/, '').split('\n') : [];
   const out = [];
   let inFeatures = false;
+  let foundFeatures = false;
   let inserted = false;
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
       if (inFeatures && !inserted) {
-        out.push('codex_hooks = true');
+        out.push('hooks = true');
         inserted = true;
       }
       inFeatures = trimmed === '[features]';
+      if (inFeatures) foundFeatures = true;
+    }
+
+    if (inFeatures && /^codex_hooks\s*=/.test(trimmed)) {
+      // `codex_hooks` was the experimental name. Current Codex emits a
+      // deprecation warning and reads `hooks` instead.
+      continue;
+    }
+
+    if (inFeatures && /^hooks\s*=/.test(trimmed)) {
+      if (!inserted) {
+        const indent = line.match(/^\s*/)?.[0] || '';
+        out.push(`${indent}hooks = true`);
+        inserted = true;
+      }
+      continue;
     }
     out.push(line);
   }
 
   if (inFeatures && !inserted) {
-    out.push('codex_hooks = true');
+    out.push('hooks = true');
     inserted = true;
   }
 
-  if (!inserted) {
+  if (!inserted && !foundFeatures) {
     if (out.length && out[out.length - 1] !== '') {
       out.push('');
     }
     out.push('[features]');
-    out.push('codex_hooks = true');
+    out.push('hooks = true');
   }
 
+  const text = `${out.join('\n').replace(/\n+$/, '')}\n`;
   return {
-    changed: true,
-    text: `${out.join('\n').replace(/\n+$/, '')}\n`,
+    changed: text !== source,
+    text,
   };
 }
 
@@ -254,7 +265,7 @@ function doctor(pluginRoot) {
     pluginRoot,
     configPath: CONFIG_PATH,
     hooksPath: HOOKS_PATH,
-    codexHooksEnabled: /\bcodex_hooks\s*=\s*true\b/.test(configText),
+    codexHooksEnabled: /\bhooks\s*=\s*true\b/.test(configText),
     hooksFilePresent: fs.existsSync(HOOKS_PATH),
     managedHooksInstalled: managedHooks,
     trackScriptPresent: fs.existsSync(trackPath),
@@ -280,7 +291,7 @@ function main() {
   if (command === 'install') {
     const result = install(pluginRoot);
     process.stdout.write(
-      `Installed DevClocked Codex hooks (${result.installedHooks})${result.configChanged ? ' and enabled codex_hooks' : ''}.\n`
+      `Installed DevClocked Codex hooks (${result.installedHooks})${result.configChanged ? ' and enabled hooks' : ''}.\n`
     );
     return;
   }

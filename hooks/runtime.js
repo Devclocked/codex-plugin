@@ -2,6 +2,7 @@
 
 const path = require('path');
 const { createPluginRuntime } = require('../runtime/core');
+const codexThreadNames = require('./codexThreadNames');
 const shellThreadNames = require('../runtime/shellThreadNames');
 
 const runtime = createPluginRuntime({
@@ -118,13 +119,26 @@ function tickInstant(input, envelope) {
   return new Date().toISOString();
 }
 
-// A shell-run thread (t3 code, Demuxx) never reaches Codex's session_index, so
-// the only name it has lives in the shell's sqlite store on this host. On a
-// remote environment these hooks are the only DevClocked code present, so the
-// name goes out on the tick and the backend labels the stream everywhere
-// (DEV-1055). Cached on the thread's stream state, negative answers included.
+// Hooks carry a thread id but no user-facing title. Resolve Codex's persisted
+// Thread.name first, then fall back to the controlling shell's title. Codex is
+// checked on every hook so `/rename` reaches the next tick immediately. The
+// shell fallback keeps its existing one-minute cache because that query walks
+// a much larger orchestration store.
 const SHELL_TITLE_TTL_MS = 60_000;
+let codexTitleResolver = (threadId) => codexThreadNames.lookupThread(threadId);
 let shellTitleResolver = (threadId) => shellThreadNames.lookupCodexThread(threadId);
+
+function codexTitleFor(stream) {
+  const threadId = stream.rootStreamId;
+  if (!threadId || threadId === 'unknown') return null;
+  if (!shellThreadNames.shellTitlesEnabled()) return null;
+
+  try {
+    return codexTitleResolver(threadId) || null;
+  } catch {
+    return null;
+  }
+}
 
 function shellTitleFor(stream) {
   const threadId = stream.rootStreamId;
@@ -149,12 +163,16 @@ function shellTitleFor(stream) {
   return hit;
 }
 
+function streamTitleFor(stream) {
+  return codexTitleFor(stream) || shellTitleFor(stream);
+}
+
 function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envelope) {
   const now = tickInstant(input, envelope);
   // Stable per queued envelope, so a replay collides with the original on the
   // backend's request_key instead of registering as new activity.
   const requestKeyId = envelope?.id || now;
-  const shellTitle = shellTitleFor(stream);
+  const streamTitle = streamTitleFor(stream);
   const toolName = normalizedToolName(input);
 
   let entity = `codex://${hookEvent}`;
@@ -210,9 +228,8 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envel
         timestamp: now,
         session_file_id: sessionFileId,
         run_id: runId,
-        // The shell's name for this thread and where it came from (DEV-1055).
-        stream_title: shellTitle ? shellTitle.title : undefined,
-        stream_title_source: shellTitle ? shellTitle.source : undefined,
+        stream_title: streamTitle ? streamTitle.title : undefined,
+        stream_title_source: streamTitle ? streamTitle.source : undefined,
         request_key: `${runId}:${hookEvent}:${stream.streamId}:${requestKeyId}`,
         runtime_ms: runtimeMs,
         runtime_started_at: now,
@@ -241,7 +258,11 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envel
   return request;
 }
 
-/** Test seam: swap the sqlite lookup for a stub. */
+/** Test seams: swap the local state lookups for stubs. */
+function setCodexTitleResolver(resolver) {
+  codexTitleResolver = resolver;
+}
+
 function setShellTitleResolver(resolver) {
   shellTitleResolver = resolver;
 }
@@ -250,9 +271,12 @@ module.exports = {
   ...runtime,
   buildTrackTickRequest,
   classifyActivity,
+  codexTitleFor,
   normalizedToolName,
   resolveRepo,
   resolveStream,
+  setCodexTitleResolver,
   setShellTitleResolver,
   shellTitleFor,
+  streamTitleFor,
 };

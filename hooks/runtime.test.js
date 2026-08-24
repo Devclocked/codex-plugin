@@ -296,16 +296,32 @@ test('the Codex hook event timestamp keeps precedence over captured_at and stays
   assert.equal(first.request_key, second.request_key);
 });
 
-// DEV-1055: shell (t3 code / Demuxx) titles ride the tick with their source.
+// Codex Thread.name wins, then shell (t3 code / Demuxx) titles are the fallback.
 const runtimeModule = require('./runtime');
 const SHELL_INPUT = { thread_id: 'thread-shell', turn_id: 'turn-1', cwd: '/tmp/example', timestamp: '2026-08-24T10:00:00.000Z' };
 const SHELL_REPO = { branch: 'main', repo_name: 'example' };
 const SHELL_NO_GIT = { repoUrl: null, repoFullName: null, workspaceFingerprint: null };
 
-test('buildTrackTickRequest carries the shell title and its source for a shell-run thread', () => {
-  runtimeModule.setShellTitleResolver((threadId) => (threadId === 'thread-shell' ? { title: 'Test Thread Rename', source: 't3code' } : null));
+test('buildTrackTickRequest carries Codex Thread.name and its source', () => {
+  runtimeModule.setCodexTitleResolver((threadId) => (threadId === 'thread-shell' ? { title: 'Fix authentication flow', source: 'codex' } : null));
+  runtimeModule.setShellTitleResolver(() => ({ title: 'Shell fallback', source: 't3code' }));
   try {
     const named = buildTrackTickRequest('UserPromptSubmit', SHELL_INPUT, resolveStream('UserPromptSubmit', SHELL_INPUT), SHELL_REPO, SHELL_NO_GIT);
+    const aiTool = named.ticks[0].activity_context.ai_tool;
+    assert.equal(aiTool.stream_title, 'Fix authentication flow');
+    assert.equal(aiTool.stream_title_source, 'codex');
+  } finally {
+    runtimeModule.setCodexTitleResolver(() => null);
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
+
+test('buildTrackTickRequest falls back to the shell title when Codex has no name', () => {
+  runtimeModule.setCodexTitleResolver(() => null);
+  runtimeModule.setShellTitleResolver((threadId) => (threadId === 'thread-shell-fallback' ? { title: 'Test Thread Rename', source: 't3code' } : null));
+  try {
+    const fallbackInput = { ...SHELL_INPUT, thread_id: 'thread-shell-fallback' };
+    const named = buildTrackTickRequest('UserPromptSubmit', fallbackInput, resolveStream('UserPromptSubmit', fallbackInput), SHELL_REPO, SHELL_NO_GIT);
     const aiTool = named.ticks[0].activity_context.ai_tool;
     assert.equal(aiTool.stream_title, 'Test Thread Rename');
     assert.equal(aiTool.stream_title_source, 't3code');
@@ -315,12 +331,14 @@ test('buildTrackTickRequest carries the shell title and its source for a shell-r
     assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title, undefined);
     assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title_source, undefined);
   } finally {
+    runtimeModule.setCodexTitleResolver(() => null);
     runtimeModule.setShellTitleResolver(() => null);
   }
 });
 
 test('shell title lookups are cached per thread, negative answers included', () => {
   let calls = 0;
+  runtimeModule.setCodexTitleResolver(() => null);
   runtimeModule.setShellTitleResolver(() => {
     calls += 1;
     return null;
@@ -331,17 +349,33 @@ test('shell title lookups are cached per thread, negative answers included', () 
     runtimeModule.shellTitleFor(stream);
     assert.equal(calls, 1);
   } finally {
+    runtimeModule.setCodexTitleResolver(() => null);
     runtimeModule.setShellTitleResolver(() => null);
   }
 });
 
-test('shell titles stay on the host when DEVCLOCKED_TRACK_SESSION_TITLES=0', () => {
+test('Codex names are refreshed on every hook so a rename is not stale', () => {
+  let title = 'Before rename';
+  runtimeModule.setCodexTitleResolver(() => ({ title, source: 'codex' }));
+  try {
+    const stream = resolveStream('UserPromptSubmit', { thread_id: 'thread-rename', turn_id: 'turn-1' });
+    assert.equal(runtimeModule.streamTitleFor(stream).title, 'Before rename');
+    title = 'After rename';
+    assert.equal(runtimeModule.streamTitleFor(stream).title, 'After rename');
+  } finally {
+    runtimeModule.setCodexTitleResolver(() => null);
+  }
+});
+
+test('all thread names stay on the host when DEVCLOCKED_TRACK_SESSION_TITLES=0', () => {
   process.env.DEVCLOCKED_TRACK_SESSION_TITLES = '0';
+  runtimeModule.setCodexTitleResolver(() => ({ title: 'Should not ship', source: 'codex' }));
   runtimeModule.setShellTitleResolver(() => ({ title: 'Should not ship', source: 'demuxx' }));
   try {
-    assert.equal(runtimeModule.shellTitleFor(resolveStream('PostToolUse', { thread_id: 'thread-off', tool_name: 'Bash' })), null);
+    assert.equal(runtimeModule.streamTitleFor(resolveStream('PostToolUse', { thread_id: 'thread-off', tool_name: 'Bash' })), null);
   } finally {
     delete process.env.DEVCLOCKED_TRACK_SESSION_TITLES;
+    runtimeModule.setCodexTitleResolver(() => null);
     runtimeModule.setShellTitleResolver(() => null);
   }
 });

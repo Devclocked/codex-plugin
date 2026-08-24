@@ -13,13 +13,25 @@ const {
 test('ensureCodexHooksFeature appends feature section when missing', () => {
   const result = ensureCodexHooksFeature('model = "gpt-5.4"\n');
   assert.equal(result.changed, true);
-  assert.match(result.text, /\[features\]\ncodex_hooks = true\n$/);
+  assert.match(result.text, /\[features\]\nhooks = true\n$/);
 });
 
 test('ensureCodexHooksFeature leaves existing enabled flag unchanged', () => {
-  const result = ensureCodexHooksFeature('[features]\ncodex_hooks = true\n');
+  const result = ensureCodexHooksFeature('[features]\nhooks = true\n');
   assert.equal(result.changed, false);
-  assert.equal(result.text, '[features]\ncodex_hooks = true\n');
+  assert.equal(result.text, '[features]\nhooks = true\n');
+});
+
+test('ensureCodexHooksFeature migrates the deprecated codex_hooks flag', () => {
+  const result = ensureCodexHooksFeature('[features]\ncodex_hooks = true\napps = true\n');
+  assert.equal(result.changed, true);
+  assert.equal(result.text, '[features]\napps = true\nhooks = true\n');
+});
+
+test('ensureCodexHooksFeature enables hooks when the current flag is false', () => {
+  const result = ensureCodexHooksFeature('[features]\nhooks = false\n');
+  assert.equal(result.changed, true);
+  assert.equal(result.text, '[features]\nhooks = true\n');
 });
 
 test('mergeManagedHooks preserves unrelated hooks and replaces prior managed hooks', () => {

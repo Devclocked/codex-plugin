@@ -11,6 +11,7 @@ Hetzner example and host-local verification steps.
 ## What it includes
 
 - Codex hooks for session lifecycle, prompt submissions, and Bash tool activity
+- Remote stream names from Codex `Thread.name`, with agent role/nickname and T3 Code/Demuxx fallbacks
 - DevClocked MCP tools for summaries and activity lookups
 - Skills for time review and weekly summaries
 - Local queue + background shipper for reliable event delivery
@@ -33,7 +34,7 @@ npm run doctor
 node ./hooks/status.js
 ```
 
-6. Restart Codex again if the install flow prompts for it
+6. Start a new Codex session and approve the four DevClocked hooks when Codex opens its hook review screen
 7. Start coding in Codex
 
 ## Local install wiring
@@ -45,7 +46,21 @@ In the monorepo, DevClocked exposes the plugin through:
 
 Codex will copy the installed plugin into its local cache on install.
 
-For runtime tracking, the plugin now owns installation into the official Codex hooks config at `~/.codex/hooks.json`. The installer also enables `codex_hooks = true` in `~/.codex/config.toml` if needed.
+For runtime tracking, the plugin owns installation into the official Codex hooks config at `~/.codex/hooks.json`. The installer enables `hooks = true` in `~/.codex/config.toml` and migrates the deprecated `codex_hooks` flag.
+
+## Remote stream names
+
+Codex hooks include the thread ID but not its user-facing name. On the remote host, the plugin reads only the matching row from Codex's local `state_*.sqlite` database and sends `Thread.name` as the DevClocked stream title. It does not read turn content or prompts. A named sub-agent can fall back to `agentRole` and `agentNickname`.
+
+The title order is:
+
+1. Codex `Thread.name`, including names set with `/rename` or `thread/name/set`
+2. Codex sub-agent role
+3. Codex sub-agent nickname
+4. The T3 Code or Demuxx thread title stored on the same remote host
+5. DevClocked's shortened Codex thread ID fallback
+
+`DEVCLOCKED_TRACK_SESSION_TITLES=0` disables all title collection on that host.
 
 ## Standalone repo publishing
 
