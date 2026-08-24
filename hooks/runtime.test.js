@@ -295,3 +295,53 @@ test('the Codex hook event timestamp keeps precedence over captured_at and stays
   assert.equal(first.timestamp, second.timestamp);
   assert.equal(first.request_key, second.request_key);
 });
+
+// DEV-1055: shell (t3 code / Demuxx) titles ride the tick with their source.
+const runtimeModule = require('./runtime');
+const SHELL_INPUT = { thread_id: 'thread-shell', turn_id: 'turn-1', cwd: '/tmp/example', timestamp: '2026-08-24T10:00:00.000Z' };
+const SHELL_REPO = { branch: 'main', repo_name: 'example' };
+const SHELL_NO_GIT = { repoUrl: null, repoFullName: null, workspaceFingerprint: null };
+
+test('buildTrackTickRequest carries the shell title and its source for a shell-run thread', () => {
+  runtimeModule.setShellTitleResolver((threadId) => (threadId === 'thread-shell' ? { title: 'Test Thread Rename', source: 't3code' } : null));
+  try {
+    const named = buildTrackTickRequest('UserPromptSubmit', SHELL_INPUT, resolveStream('UserPromptSubmit', SHELL_INPUT), SHELL_REPO, SHELL_NO_GIT);
+    const aiTool = named.ticks[0].activity_context.ai_tool;
+    assert.equal(aiTool.stream_title, 'Test Thread Rename');
+    assert.equal(aiTool.stream_title_source, 't3code');
+
+    const plainInput = { ...SHELL_INPUT, thread_id: 'thread-plain' };
+    const unnamed = buildTrackTickRequest('UserPromptSubmit', plainInput, resolveStream('UserPromptSubmit', plainInput), SHELL_REPO, SHELL_NO_GIT);
+    assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title, undefined);
+    assert.equal(unnamed.ticks[0].activity_context.ai_tool.stream_title_source, undefined);
+  } finally {
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
+
+test('shell title lookups are cached per thread, negative answers included', () => {
+  let calls = 0;
+  runtimeModule.setShellTitleResolver(() => {
+    calls += 1;
+    return null;
+  });
+  try {
+    const stream = resolveStream('PostToolUse', { thread_id: 'thread-cache', turn_id: 'turn-2', tool_name: 'Bash' });
+    runtimeModule.shellTitleFor(stream);
+    runtimeModule.shellTitleFor(stream);
+    assert.equal(calls, 1);
+  } finally {
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
+
+test('shell titles stay on the host when DEVCLOCKED_TRACK_SESSION_TITLES=0', () => {
+  process.env.DEVCLOCKED_TRACK_SESSION_TITLES = '0';
+  runtimeModule.setShellTitleResolver(() => ({ title: 'Should not ship', source: 'demuxx' }));
+  try {
+    assert.equal(runtimeModule.shellTitleFor(resolveStream('PostToolUse', { thread_id: 'thread-off', tool_name: 'Bash' })), null);
+  } finally {
+    delete process.env.DEVCLOCKED_TRACK_SESSION_TITLES;
+    runtimeModule.setShellTitleResolver(() => null);
+  }
+});
