@@ -270,6 +270,7 @@ test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', (
     tool_input: { file_path: '/tmp/project/src/app.ts', content: 'const SECRET = "sk-live-xyz";' },
     command: 'aws s3 cp secret.txt s3://bucket --key AKIASECRET',
     prompt: 'my private prompt with confidential business plans',
+    transcript_path: '/tmp/private-transcript-with-confidential-name.jsonl',
     edits: [{ old_string: 'a\nb\nc', new_string: 'a\nb\nc\nd\ne' }],
   });
 
@@ -278,6 +279,7 @@ test('enqueueHookEvent drops raw prompt/diff/command content and writes 0600', (
   assert.ok(!raw.includes('AKIASECRET'), 'command args must not be on disk');
   assert.ok(!raw.includes('confidential'), 'raw prompt must not be on disk');
   assert.ok(!raw.includes('prompt'), 'prompt field must be dropped entirely');
+  assert.ok(!raw.includes('private-transcript'), 'transcript path must not be on disk');
 
   const envelope = JSON.parse(raw);
   // Consumed fields survive.

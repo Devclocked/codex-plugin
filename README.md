@@ -15,6 +15,8 @@ Hetzner example and host-local verification steps.
 - DevClocked MCP tools for summaries and activity lookups
 - Skills for time review and weekly summaries
 - Local queue + background shipper for reliable event delivery
+- Targeted agent-run sync after `Stop` when Codex supplies an absolute
+  transcript path
 
 ## Setup
 
@@ -104,6 +106,14 @@ node ./hooks/status.js
 - Codex hooks are the primary live source for Codex activity
 - The desktop daemon remains a fallback by watching `~/.codex/sessions/**/*.jsonl`
 - When both are present, Codex plugin activity wins and the daemon suppresses duplicate Codex ticks
+
+On `Stop`, the plugin starts
+`npx -y @devclocked/cli@latest agent-runs sync` as a detached process when the
+hook provides an absolute transcript path. The CLI resolves and validates the
+path under `~/.codex/sessions` before reading it. The plugin does not keep the
+path in its queue or logs. The CLI reads the transcript locally and sends only
+agent-run metadata. It does not send prompts, responses, commands, or file
+contents.
 
 ## Debugging
 
