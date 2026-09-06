@@ -379,3 +379,28 @@ test('all thread names stay on the host when DEVCLOCKED_TRACK_SESSION_TITLES=0',
     runtimeModule.setShellTitleResolver(() => null);
   }
 });
+
+test('UserPromptSubmit stamps human_presence and nothing else does (DEV-1258)', () => {
+  const stream = resolveStream('UserPromptSubmit', { thread_id: 'thread-1258', turn_id: 'turn-1' });
+  const repo = { branch: 'main', repo_name: 'example' };
+  const noGit = { repoUrl: null, repoFullName: null, workspaceFingerprint: null };
+
+  const prompt = buildTrackTickRequest(
+    'UserPromptSubmit',
+    { thread_id: 'thread-1258', turn_id: 'turn-1', cwd: '/tmp', prompt: 'never serialised' },
+    stream,
+    repo,
+    noGit
+  );
+  assert.equal(prompt.ticks[0].activity_context.human_presence, true);
+  assert.equal(JSON.stringify(prompt).includes('never serialised'), false);
+
+  const tool = buildTrackTickRequest(
+    'PostToolUse',
+    { thread_id: 'thread-1258', turn_id: 'turn-1', tool_name: 'Bash' },
+    stream,
+    repo,
+    noGit
+  );
+  assert.equal('human_presence' in tool.ticks[0].activity_context, false);
+});

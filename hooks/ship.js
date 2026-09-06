@@ -28,6 +28,12 @@ function isLifecycleEvent(hookEvent) {
   return ['SessionStart', 'Stop'].includes(hookEvent);
 }
 
+// A prompt submit is the only human-presence signal the plugin has, so it must
+// never be lost to the throttle behind a same-type tick (DEV-1258).
+function bypassesThrottle(hookEvent) {
+  return isLifecycleEvent(hookEvent) || hookEvent === 'UserPromptSubmit';
+}
+
 // True when the newly classified tick's activity type differs from the last
 // one shipped for this stream. Used to let transitions through the 30s
 // throttle window instead of hard-dropping them. When there's no recorded
@@ -127,7 +133,7 @@ async function processEnvelope(filePath, apiKey) {
   }
 
   const throttleStateId = stream.throttleId || stream.streamId;
-  if (!isLifecycleEvent(hookEvent) && shouldThrottle(throttleStateId)) {
+  if (!bypassesThrottle(hookEvent) && shouldThrottle(throttleStateId)) {
     const priorState = getStreamState(throttleStateId);
     const newActivity = classifyActivity(hookEvent, input, stream);
     if (!isActivityTypeTransition(priorState, newActivity.activity_type)) {
@@ -209,6 +215,7 @@ module.exports = {
   DELAYED_ENVELOPE_MS,
   STALE_SESSION_END_MS,
   envelopeAgeMs,
+  bypassesThrottle,
   isActivityTypeTransition,
   isLifecycleEvent,
   isStaleSessionEnd,

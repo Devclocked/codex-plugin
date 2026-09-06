@@ -24,9 +24,11 @@ runtime.callEdgeFunction = async (apiKey, fnName, body) => {
 const {
   DELAYED_ENVELOPE_MS,
   STALE_SESSION_END_MS,
+  bypassesThrottle,
   envelopeAgeMs,
   isActivityTypeTransition,
   isStaleSessionEnd,
+  isLifecycleEvent,
   processEnvelope,
   staleLifecycleReason,
 } = require('./ship');
@@ -325,5 +327,31 @@ test('a truncated queue file is quarantined and blocks neither the next envelope
   assert.equal(edgeCalls.length, 2);
 
   fs.rmSync(runtime.QUARANTINE_DIR, { recursive: true, force: true });
+  purgeQueues();
+});
+
+// --- DEV-1258: prompt-submit ticks carry human presence past the throttle ----
+
+test('UserPromptSubmit bypasses the throttle without becoming a lifecycle event (DEV-1258)', () => {
+  assert.equal(bypassesThrottle('UserPromptSubmit'), true);
+  assert.equal(bypassesThrottle('Stop'), true);
+  assert.equal(bypassesThrottle('PostToolUse'), false);
+  assert.equal(isLifecycleEvent('UserPromptSubmit'), false);
+});
+
+test('a prompt within 30s of a planning tick still ships with human_presence (DEV-1258)', async () => {
+  purgeQueues();
+  edgeUp = true;
+  edgeCalls.length = 0;
+  const threadId = 'thread-1258-prompt';
+  runtime.saveStreamState(threadId, { last_tick_at: Date.now(), last_activity_type: 'planning' });
+  const filePath = runtime.enqueueHookEvent({ hook_event_name: 'UserPromptSubmit', thread_id: threadId, turn_id: 'turn-1', cwd: '/tmp' });
+
+  const result = await processEnvelope(filePath, 'test-api-key');
+
+  assert.equal(result.shipped, true);
+  assert.equal(edgeCalls.length, 1);
+  assert.equal(edgeCalls[0].body.ticks[0].activity_context.human_presence, true);
+  assert.equal(fs.existsSync(filePath), false);
   purgeQueues();
 });

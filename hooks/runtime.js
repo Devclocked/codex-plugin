@@ -220,6 +220,10 @@ function buildTrackTickRequest(hookEvent, input, stream, repo, gitContext, envel
     repository_full_name: gitContext.repoFullName || undefined,
     repos: gitContext.repoFullName ? { full_name: gitContext.repoFullName } : undefined,
     activity_context: {
+      // A submitted prompt is the one hook that proves a human is at the keyboard;
+      // ingest counts it as human time only when this flag is set (DEV-1258).
+      // Boolean only: prompt text never leaves the machine.
+      ...(hookEvent === 'UserPromptSubmit' ? { human_presence: true } : {}),
       ai_tool: {
         tool: 'codex-cli',
         activity_type: activity.activity_type,
