@@ -648,3 +648,57 @@ test('a failed write leaves no temp file behind (DEV-936 R2)', () => {
     []
   );
 });
+
+test('remote probe timeout keeps the git context but is not cached (DEV-1274)', () => {
+  const repoRoot = makeDirs('projects', 'remote-times-out');
+  let remoteFailing = true;
+  const runtime = makeRuntime((command) => {
+    if (command.includes('get-url') && remoteFailing) {
+      throw { killed: true, signal: 'SIGTERM', status: null };
+    }
+    return repoExec(repoRoot, 'git@github.com:acme/remote-times-out.git')(command);
+  });
+
+  // Deferring here would drop the fingerprint, and track-tick rejects a tick
+  // with no fingerprint outright — the time would be deleted, not renamed.
+  const degraded = runtime.resolveGitContext({ cwd: repoRoot });
+  assert.equal(degraded.resolution, 'git');
+  assert.equal(degraded.repoName, 'remote-times-out');
+  assert.equal(degraded.repoUrl, null);
+  assert.equal(degraded.repoFullName, null);
+  assert.ok(degraded.workspaceFingerprint);
+  assert.equal(degraded.remoteProbeDegraded, true);
+
+  // Not cached, so the next hook re-probes and picks the remote back up.
+  remoteFailing = false;
+  const recovered = runtime.resolveGitContext({ cwd: repoRoot });
+  assert.equal(recovered.repoUrl, 'git@github.com:acme/remote-times-out.git');
+  assert.equal(recovered.repoFullName, 'acme/remote-times-out');
+  assert.equal(recovered.remoteProbeDegraded, undefined);
+  assert.equal(recovered.workspaceFingerprint, degraded.workspaceFingerprint);
+});
+
+test('remote probe git_error (no origin) is a real local project: cached as before (DEV-1274)', () => {
+  const repoRoot = makeDirs('projects', 'no-origin-local');
+  let calls = 0;
+  const runtime = makeRuntime((command) => {
+    if (command.includes('get-url')) calls += 1;
+    return repoExec(repoRoot, null)(command);
+  });
+
+  const context = runtime.resolveGitContext({ cwd: repoRoot });
+  assert.equal(context.resolution, 'git');
+  assert.equal(context.resolutionFailure, null);
+  assert.equal(context.repoUrl, null);
+  assert.equal(context.repoFullName, null);
+  assert.equal(context.repoName, 'no-origin-local');
+  assert.equal(context.gitRoot, repoRoot);
+  assert.ok(context.workspaceFingerprint);
+  assert.equal(context.remoteProbeDegraded, undefined);
+
+  // Cached: git answered, so the second call never re-probes the remote.
+  assert.equal(calls, 1);
+  const again = runtime.resolveGitContext({ cwd: repoRoot });
+  assert.equal(again.repoName, 'no-origin-local');
+  assert.equal(calls, 1);
+});

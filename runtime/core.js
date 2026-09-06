@@ -479,7 +479,14 @@ function createPluginRuntime(options) {
   }
 
   function buildRepoGitContext(gitRoot) {
-    const repoUrl = sanitizeRepoUrl(gitExec(gitRoot, 'git remote get-url origin'));
+    // A remote probe git could not answer (timeout, missing binary) is not
+    // "no origin", but the toplevel already succeeded so the fingerprint and
+    // the basename are still sound: ship the same context and flag it so the
+    // caller does not cache a name that may be missing its repo (DEV-1274).
+    // Only git_error means git ran and reported no origin.
+    const remoteResult = gitExecClassified(gitRoot, 'git remote get-url origin');
+    const remoteProbeDegraded = !remoteResult.ok && remoteResult.failure !== 'git_error';
+    const repoUrl = sanitizeRepoUrl(remoteResult.ok ? remoteResult.stdout : null);
     const repoFullName = parseRepoFullName(repoUrl);
     const branch = gitExec(gitRoot, 'git rev-parse --abbrev-ref HEAD');
     const repoName = repoFullName ? repoFullName.split('/').pop() : path.basename(gitRoot);
@@ -494,6 +501,7 @@ function createPluginRuntime(options) {
       workspacePath: gitRoot,
       resolution: 'git',
       resolutionFailure: null,
+      ...(remoteProbeDegraded ? { remoteProbeDegraded: true } : {}),
     };
   }
 
@@ -547,7 +555,7 @@ function createPluginRuntime(options) {
     const rootResult = gitExecClassified(identityDir, 'git rev-parse --show-toplevel');
     if (rootResult.ok) {
       const gitContext = buildRepoGitContext(rootResult.stdout);
-      saveCachedGitContext(identityDir, gitContext);
+      if (!gitContext.remoteProbeDegraded) saveCachedGitContext(identityDir, gitContext);
       return gitContext;
     }
 
@@ -566,7 +574,7 @@ function createPluginRuntime(options) {
       const fileRootResult = gitExecClassified(fileDir, 'git rev-parse --show-toplevel');
       if (fileRootResult.ok) {
         const gitContext = buildRepoGitContext(fileRootResult.stdout);
-        saveCachedGitContext(identityDir, gitContext);
+        if (!gitContext.remoteProbeDegraded) saveCachedGitContext(identityDir, gitContext);
         return gitContext;
       }
     }
